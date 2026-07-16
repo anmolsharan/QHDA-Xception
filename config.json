@@ -1,0 +1,8 @@
+{
+  "img_size": 224,
+  "batch_size": 16,
+  "n_qubits": 4,
+  "n_classes": 4,
+  "architecture": "Xception + Quantum (PennyLane backprop)",
+  "cam_layer": "block14_sepconv2_act"
+}
