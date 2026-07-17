@@ -54,7 +54,7 @@ try:
     print("✅ Configuration loaded successfully")
     print(f"✅ Image Size: {IMG_SIZE}")
     print(f"✅ Classes: {classes}")
-    print(f"✅ Grad-CAM++ target layer: {CAM_LAYER_NAME}")
+    print(f"✅ Grad-CAM target layer: {CAM_LAYER_NAME}")
 
 except Exception as e:
 
@@ -125,7 +125,7 @@ except Exception:
 # =========================================================
 
 print("=" * 60)
-print("SETTING UP GRAD-CAM++...")
+print("SETTING UP GRAD-CAM...")
 print("=" * 60)
 
 GRADCAM_READY = False
@@ -205,12 +205,12 @@ try:
 
     GRADCAM_READY = True
 
-    print(f"✅ Grad-CAM++ ready (head layers after backbone: "
+    print(f"✅ Grad-CAM ready (head layers after backbone: "
           f"{[l.name for l in gradcam_head_layers]})")
 
 except Exception:
 
-    print("⚠️  Grad-CAM++ setup failed — /predict/gradcam will be unavailable")
+    print("⚠️  Grad-CAM setup failed — /predict/gradcam will be unavailable")
     traceback.print_exc()
 
 # =========================================================
@@ -307,49 +307,50 @@ def preprocess(image_bytes, return_raw=False):
         )
 
 # =========================================================
-# GRAD-CAM++ CORE
+# GRAD-CAM CORE
+# =========================================================
+#
+# NOTE: True Grad-CAM++ requires 2nd/3rd-order derivatives of the class
+# score w.r.t. the conv feature map. In this model, the conv layer feeds
+# into the final score THROUGH a PennyLane QuantumLayer, and differentiating
+# a quantum circuit simulation a second/third time is drastically more
+# expensive than the first-order case (which is all that's needed for
+# training). In production this caused requests to hang past the Cloud Run
+# timeout with no error, just silence.
+#
+# We use standard Grad-CAM (Selvaraju et al.) instead — a single backward
+# pass, first-order gradients only. For single-lesion classification (as
+# opposed to detecting multiple instances of a class in one image, which is
+# where Grad-CAM++ actually earns its keep), the resulting heatmaps are
+# visually near-identical, at a fraction of the compute cost.
 # =========================================================
 
-def grad_cam_plus_plus(feature_model, head_layers, img_tensor, class_idx):
+def grad_cam(feature_model, head_layers, img_tensor, class_idx):
     """
-    Computes a Grad-CAM++ heatmap (values in [0, 1], shape H x W matching
-    the conv feature map's spatial size) for the given class index.
+    Computes a Grad-CAM heatmap (values in [0, 1], shape H x W matching the
+    conv feature map's spatial size) for the given class index.
     """
 
     img_tensor = tf.convert_to_tensor(img_tensor, dtype=tf.float32)
 
-    with tf.GradientTape() as tape1:
-        with tf.GradientTape() as tape2:
-            with tf.GradientTape() as tape3:
+    with tf.GradientTape() as tape:
 
-                conv_out, backbone_out = feature_model(img_tensor, training=False)
+        conv_out, backbone_out = feature_model(img_tensor, training=False)
+        tape.watch(conv_out)
 
-                tape1.watch(conv_out)
-                tape2.watch(conv_out)
-                tape3.watch(conv_out)
+        x = backbone_out
+        for layer in head_layers:
+            x = layer(x, training=False)
 
-                x = backbone_out
-                for layer in head_layers:
-                    x = layer(x, training=False)
+        score = x[:, class_idx]
 
-                score = x[:, class_idx]
-
-            first_grad = tape3.gradient(score, conv_out)
-        second_grad = tape2.gradient(first_grad, conv_out)
-    third_grad = tape1.gradient(second_grad, conv_out)
+    grads = tape.gradient(score, conv_out)
 
     conv_out = conv_out[0].numpy()
-    first_grad = first_grad[0].numpy()
-    second_grad = second_grad[0].numpy()
-    third_grad = third_grad[0].numpy()
+    grads = grads[0].numpy()
 
-    global_sum = np.sum(conv_out, axis=(0, 1))
-
-    alpha_denom = 2.0 * second_grad + global_sum * third_grad
-    alpha_denom = np.where(alpha_denom != 0.0, alpha_denom, 1e-10)
-    alphas = second_grad / alpha_denom
-
-    weights = np.sum(alphas * np.maximum(first_grad, 0), axis=(0, 1))
+    # global-average-pool the gradients over the spatial dims -> per-channel importance
+    weights = np.mean(grads, axis=(0, 1))
 
     cam = np.sum(weights * conv_out, axis=-1)
     cam = np.maximum(cam, 0)
@@ -384,7 +385,7 @@ def encode_png_base64(img_rgb):
 
 def build_gradcam_gif_base64(original_rgb, heatmap_rgb, steps=12, hold_frames=6, duration_ms=80):
     """
-    Builds an animated GIF fading from the original image to the Grad-CAM++
+    Builds an animated GIF fading from the original image to the Grad-CAM
     overlay and back, so the highlighted region is easy to spot.
     """
 
@@ -556,7 +557,7 @@ async def predict_with_gradcam(
     if not GRADCAM_READY:
         raise HTTPException(
             status_code=500,
-            detail="Grad-CAM++ is not available for this model (setup failed at startup)"
+            detail="Grad-CAM is not available for this model (setup failed at startup)"
         )
 
     contents = await _read_and_validate_image(image)
@@ -606,7 +607,7 @@ async def predict_with_gradcam(
 
     try:
 
-        heatmap = grad_cam_plus_plus(
+        heatmap = grad_cam(
             gradcam_feature_model,
             gradcam_head_layers,
             img,
@@ -622,7 +623,7 @@ async def predict_with_gradcam(
         gif_b64 = build_gradcam_gif_base64(raw_resized, heatmap_rgb)
 
         print("=" * 60)
-        print("GRAD-CAM++ SUCCESS")
+        print("GRAD-CAM SUCCESS")
         print(f"Prediction    : {prediction}")
         print(f"Explaining    : {classes[explain_idx]}")
         print("=" * 60)
@@ -639,10 +640,10 @@ async def predict_with_gradcam(
 
     except Exception:
 
-        print("❌ Grad-CAM++ generation failed")
+        print("❌ Grad-CAM generation failed")
         traceback.print_exc()
 
-        raise HTTPException(status_code=500, detail="Grad-CAM++ generation failed")
+        raise HTTPException(status_code=500, detail="Grad-CAM generation failed")
 
 # =========================================================
 # STARTUP LOGS
@@ -651,7 +652,7 @@ async def predict_with_gradcam(
 print("=" * 60)
 print("🚀 API STARTED")
 print(f"✅ MODEL LOADED   : {MODEL_LOADED}")
-print(f"✅ GRAD-CAM++     : {GRADCAM_READY}")
+print(f"✅ GRAD-CAM       : {GRADCAM_READY}")
 print(f"✅ CLASSES        : {classes}")
 print("=" * 60)
 
