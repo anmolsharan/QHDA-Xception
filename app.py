@@ -307,52 +307,75 @@ def preprocess(image_bytes, return_raw=False):
         )
 
 # =========================================================
-# GRAD-CAM CORE
+# SCORE-CAM CORE
 # =========================================================
 #
-# NOTE: True Grad-CAM++ requires 2nd/3rd-order derivatives of the class
-# score w.r.t. the conv feature map. In this model, the conv layer feeds
-# into the final score THROUGH a PennyLane QuantumLayer, and differentiating
-# a quantum circuit simulation a second/third time is drastically more
-# expensive than the first-order case (which is all that's needed for
-# training). In production this caused requests to hang past the Cloud Run
-# timeout with no error, just silence.
+# We initially tried Grad-CAM / Grad-CAM++, both of which need a gradient
+# computed THROUGH the PennyLane QuantumLayer. In production this crashed:
+# PennyLane's TF-autograph-generated code hits a broken branch the moment
+# the quantum layer's forward pass runs inside an active tf.GradientTape —
+# even before .gradient() is called. This is an internal PennyLane/autograph
+# incompatibility, not something fixable from app.py.
 #
-# We use standard Grad-CAM (Selvaraju et al.) instead — a single backward
-# pass, first-order gradients only. For single-lesion classification (as
-# opposed to detecting multiple instances of a class in one image, which is
-# where Grad-CAM++ actually earns its keep), the resulting heatmaps are
-# visually near-identical, at a fraction of the compute cost.
+# Score-CAM (Wang et al., 2020) sidesteps this entirely: it needs NO
+# gradients, only plain forward passes — the exact call pattern /predict
+# already uses successfully. For each of the top-K most active channels in
+# the conv feature map, we mask the original image with that channel's
+# (upsampled, normalized) activation map, run a normal forward pass, and use
+# the resulting class confidence as that channel's importance weight.
 # =========================================================
 
-def grad_cam(feature_model, head_layers, img_tensor, class_idx):
+SCORECAM_TOP_K = 32  # number of channels to use; higher = slower but finer detail
+
+
+def score_cam(feature_model, head_layers, raw_image_uint8, class_idx, top_k=SCORECAM_TOP_K):
     """
-    Computes a Grad-CAM heatmap (values in [0, 1], shape H x W matching the
-    conv feature map's spatial size) for the given class index.
+    Computes a Score-CAM heatmap (values in [0, 1], shape IMG_SIZE x IMG_SIZE)
+    for the given class index, using only forward passes (no gradients).
     """
 
-    img_tensor = tf.convert_to_tensor(img_tensor, dtype=tf.float32)
+    img_norm = raw_image_uint8.astype(np.float32) / 255.0
+    img_batch = np.expand_dims(img_norm, axis=0)
 
-    with tf.GradientTape() as tape:
+    conv_out, backbone_out = feature_model.predict(img_batch, verbose=0)
+    conv_out = conv_out[0]  # (h, w, channels)
 
-        conv_out, backbone_out = feature_model(img_tensor, training=False)
-        tape.watch(conv_out)
+    # pick the most active channels to keep the number of extra forward
+    # passes manageable (this is the standard "Faster Score-CAM" trick)
+    channel_scores = np.sum(np.abs(conv_out), axis=(0, 1))
+    k = min(top_k, channel_scores.shape[0])
+    top_indices = np.argsort(channel_scores)[-k:]
 
-        x = backbone_out
+    masks = []
+    for idx in top_indices:
+        chan = conv_out[:, :, idx]
+        chan = cv2.resize(chan, (IMG_SIZE, IMG_SIZE))
+        c_min, c_max = chan.min(), chan.max()
+        if (c_max - c_min) < 1e-8:
+            norm_mask = np.zeros_like(chan, dtype=np.float32)
+        else:
+            norm_mask = ((chan - c_min) / (c_max - c_min)).astype(np.float32)
+        masks.append(norm_mask)
+
+    masks = np.stack(masks, axis=0)  # (k, IMG_SIZE, IMG_SIZE)
+
+    # mask the ORIGINAL image (not the backbone features) with each channel's
+    # activation map, then batch all of them through one forward pass
+    masked_batch = img_norm[None, :, :, :] * masks[:, :, :, None]  # (k, IMG_SIZE, IMG_SIZE, 3)
+
+    _, masked_backbone_out = feature_model.predict(masked_batch, verbose=0)
+
+    if head_layers:
+        x = tf.convert_to_tensor(masked_backbone_out, dtype=tf.float32)
         for layer in head_layers:
             x = layer(x, training=False)
+        masked_preds = x.numpy()
+    else:
+        masked_preds = masked_backbone_out
 
-        score = x[:, class_idx]
+    weights = masked_preds[:, class_idx]  # (k,) — confidence per masked image
 
-    grads = tape.gradient(score, conv_out)
-
-    conv_out = conv_out[0].numpy()
-    grads = grads[0].numpy()
-
-    # global-average-pool the gradients over the spatial dims -> per-channel importance
-    weights = np.mean(grads, axis=(0, 1))
-
-    cam = np.sum(weights * conv_out, axis=-1)
+    cam = np.tensordot(weights, masks, axes=([0], [0]))  # (IMG_SIZE, IMG_SIZE)
     cam = np.maximum(cam, 0)
 
     if cam.max() != 0:
@@ -602,15 +625,15 @@ async def predict_with_gradcam(
         explain_idx = pred_idx
 
     # -----------------------------------------------------
-    # GRAD-CAM++
+    # SCORE-CAM
     # -----------------------------------------------------
 
     try:
 
-        heatmap = grad_cam(
+        heatmap = score_cam(
             gradcam_feature_model,
             gradcam_head_layers,
-            img,
+            raw_resized,
             explain_idx
         )
 
@@ -623,7 +646,7 @@ async def predict_with_gradcam(
         gif_b64 = build_gradcam_gif_base64(raw_resized, heatmap_rgb)
 
         print("=" * 60)
-        print("GRAD-CAM SUCCESS")
+        print("SCORE-CAM SUCCESS")
         print(f"Prediction    : {prediction}")
         print(f"Explaining    : {classes[explain_idx]}")
         print("=" * 60)
@@ -640,10 +663,10 @@ async def predict_with_gradcam(
 
     except Exception:
 
-        print("❌ Grad-CAM generation failed")
+        print("❌ Score-CAM generation failed")
         traceback.print_exc()
 
-        raise HTTPException(status_code=500, detail="Grad-CAM generation failed")
+        raise HTTPException(status_code=500, detail="Score-CAM generation failed")
 
 # =========================================================
 # STARTUP LOGS
