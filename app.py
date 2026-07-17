@@ -325,7 +325,7 @@ def preprocess(image_bytes, return_raw=False):
 # the resulting class confidence as that channel's importance weight.
 # =========================================================
 
-SCORECAM_TOP_K = 32  # number of channels to use; higher = slower but finer detail
+SCORECAM_TOP_K = 64  # number of channels to use; higher = slower but finer detail
 
 
 def score_cam(feature_model, head_layers, raw_image_uint8, class_idx, top_k=SCORECAM_TOP_K):
@@ -360,8 +360,14 @@ def score_cam(feature_model, head_layers, raw_image_uint8, class_idx, top_k=SCOR
     masks = np.stack(masks, axis=0)  # (k, IMG_SIZE, IMG_SIZE)
 
     # mask the ORIGINAL image (not the backbone features) with each channel's
-    # activation map, then batch all of them through one forward pass
-    masked_batch = img_norm[None, :, :, :] * masks[:, :, :, None]  # (k, IMG_SIZE, IMG_SIZE, 3)
+    # activation map, then batch all of them through one forward pass.
+    # A fully-blacked-out image (all-zero mask) is appended as a baseline so
+    # we can measure how much each channel's mask *increases* confidence
+    # above doing nothing, instead of using raw (noisier) confidence values.
+    baseline_mask = np.zeros((1, IMG_SIZE, IMG_SIZE), dtype=np.float32)
+    all_masks = np.concatenate([masks, baseline_mask], axis=0)  # (k+1, H, W)
+
+    masked_batch = img_norm[None, :, :, :] * all_masks[:, :, :, None]  # (k+1, H, W, 3)
 
     _, masked_backbone_out = feature_model.predict(masked_batch, verbose=0)
 
@@ -373,10 +379,23 @@ def score_cam(feature_model, head_layers, raw_image_uint8, class_idx, top_k=SCOR
     else:
         masked_preds = masked_backbone_out
 
-    weights = masked_preds[:, class_idx]  # (k,) — confidence per masked image
+    raw_scores = masked_preds[:, class_idx]  # (k+1,)
+    baseline_score = raw_scores[-1]
+    channel_deltas = raw_scores[:-1] - baseline_score  # (k,) — gain over doing nothing
+
+    # softmax-normalize so channels that actually help the class stand out
+    # sharply from ones that barely matter (per the original Score-CAM paper)
+    exp_deltas = np.exp(channel_deltas - np.max(channel_deltas))
+    weights = exp_deltas / np.sum(exp_deltas)
 
     cam = np.tensordot(weights, masks, axes=([0], [0]))  # (IMG_SIZE, IMG_SIZE)
     cam = np.maximum(cam, 0)
+
+    # sharpen: drop the bottom ~15% of activation so low-confidence "haze"
+    # covering the whole brain doesn't survive into the final heatmap
+    if cam.max() > 0:
+        threshold = np.percentile(cam, 15)
+        cam = np.where(cam >= threshold, cam - threshold, 0)
 
     if cam.max() != 0:
         cam = cam / cam.max()
